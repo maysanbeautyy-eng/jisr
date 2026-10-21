@@ -127,13 +127,14 @@
     <span class="ear"><span class="dot fa"></span><span id="earFa"></span></span>
     <button class="btn" id="swapEars" type="button">بدّل الأذنين</button>
     <button class="btn" id="testEars" type="button">اختبار الأذنين</button>
+    <button class="btn" id="flip" type="button"></button>
   </div>
 </div>
 
 <main>
   <div class="wrap">
     <div class="stack">
-      <div class="hint" id="hint">اضغط زر لغتك وتكلّم. الترجمة تُنطق في أذن الطرف الثاني فقط. اضغط «اختبار الأذنين» أول مرة حتى تتأكد من الجهة.</div>
+      <div class="hint" id="hint">اضغط زر لغتك مرة وحدة وتكلّم بشكل متواصل. كل جملة تنترجم وتنطق مباشرة في أذن الطرف الثاني، وبعدها يتحول الاستماع تلقائياً للطرف الثاني. اضغط الزر مرة ثانية للإيقاف. إذا ما سمعت صوت، افصل وضع الصامت وجرّب «اختبار الأذنين».</div>
       <div id="turns" class="stack" style="padding:0"></div>
       <div class="live" id="live" aria-live="polite"></div>
 
@@ -213,7 +214,7 @@
   function lsGet(k, fb) { try { var v = localStorage.getItem(KEY + ':' + k); return v ? JSON.parse(v) : fb; } catch (e) { return fb; } }
   function lsSet(k, v) { try { localStorage.setItem(KEY + ':' + k, JSON.stringify(v)); } catch (e) {} }
 
-  var DEFAULTS = { iraqiEar: 'left', claudeKey: '', claudeModel: 'claude-haiku-5-5', ttsMode: 'device', openaiKey: '', voice: 'nova', arLocale: 'ar-IQ' };
+  var DEFAULTS = { iraqiEar: 'left', claudeKey: '', claudeModel: 'claude-haiku-5-5', ttsMode: 'device', openaiKey: '', voice: 'nova', arLocale: 'ar-IQ', autoFlip: true };
   var S = Object.assign({}, DEFAULTS, lsGet('settings', {}));
   var turns = lsGet('turns', []);
 
@@ -299,15 +300,40 @@
     if (ctx.state === 'suspended') ctx.resume();
     return ctx;
   }
+  var silentEl = null;
+  function silentWavUrl() {
+    var n = 8000, b = new Uint8Array(44 + n), dv = new DataView(b.buffer);
+    var w = function (o, str) { for (var i = 0; i < str.length; i++) b[o + i] = str.charCodeAt(i); };
+    w(0, 'RIFF'); dv.setUint32(4, 36 + n, true); w(8, 'WAVE'); w(12, 'fmt ');
+    dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+    dv.setUint32(24, 8000, true); dv.setUint32(28, 8000, true); dv.setUint16(32, 1, true); dv.setUint16(34, 8, true);
+    w(36, 'data'); dv.setUint32(40, n, true);
+    for (var i = 0; i < n; i++) b[44 + i] = 128;
+    return URL.createObjectURL(new Blob([b], { type: 'audio/wav' }));
+  }
+  function setSession(type) { try { if (navigator.audioSession) navigator.audioSession.type = type; } catch (e) {} }
+  /* Must run inside a tap. Playing a silent <audio> makes iOS ignore the silent switch for Web Audio. */
+  function unlockAudio() {
+    setSession('playback');
+    ensureAudio();
+    try {
+      if (!silentEl) { silentEl = new Audio(silentWavUrl()); silentEl.loop = true; silentEl.setAttribute('playsinline', ''); }
+      var pr = silentEl.play(); if (pr && pr.catch) pr.catch(function () {});
+    } catch (e) {}
+    try { if ('speechSynthesis' in window) { var u = new SpeechSynthesisUtterance(' '); u.volume = 0; speechSynthesis.speak(u); } } catch (e) {}
+  }
   function panNode(pan) {
     if (ctx.createStereoPanner) { var p = ctx.createStereoPanner(); p.pan.value = pan; return p; }
     return null;
   }
   function playBuffer(buf, pan) {
-    var src = ctx.createBufferSource(); src.buffer = buf;
-    var p = panNode(pan);
-    if (p) { src.connect(p); p.connect(ctx.destination); } else { src.connect(ctx.destination); }
-    src.start();
+    return new Promise(function (resolve) {
+      var src = ctx.createBufferSource(); src.buffer = buf;
+      var p = panNode(pan);
+      if (p) { src.connect(p); p.connect(ctx.destination); } else { src.connect(ctx.destination); }
+      src.onended = resolve;
+      src.start();
+    });
   }
   function beep(pan, when) {
     var o = ctx.createOscillator(), g = ctx.createGain(), p = panNode(pan);
@@ -319,7 +345,7 @@
     o.start(t0); o.stop(t0 + 0.5);
   }
   function testEars() {
-    if (!ensureAudio()) { toast('المتصفح ما يدعم الصوت'); return; }
+    unlockAudio(); if (!ctx) { toast('المتصفح ما يدعم الصوت'); return; }
     $('earAr').textContent = 'تسمع الآن: عراقي';
     beep(earPan('ar'), 0);
     beep(earPan('fa'), 1.0);
@@ -331,16 +357,22 @@
     return new Promise(function (res, rej) { ctx.decodeAudioData(ab, res, rej); });
   }
   function deviceSpeak(text, lang) {
-    if (!('speechSynthesis' in window)) { toast('الجهاز ما عنده نطق صوتي'); return; }
-    var prefix = lang === 'fa' ? 'fa' : 'ar';
-    var voice = (speechSynthesis.getVoices() || []).filter(function (v) { return v.lang.toLowerCase().indexOf(prefix) === 0; })[0];
-    if (!voice && lang === 'fa') { toast('الآيفون ما عنده صوت فارسي. فعّل صوت OpenAI من الإعدادات.'); return; }
-    var u = new SpeechSynthesisUtterance(text);
-    u.lang = lang === 'fa' ? 'fa-IR' : 'ar-SA';
-    if (voice) u.voice = voice;
-    speechSynthesis.cancel(); speechSynthesis.speak(u);
+    return new Promise(function (resolve) {
+      if (!('speechSynthesis' in window)) { toast('الجهاز ما عنده نطق صوتي'); return resolve(); }
+      var prefix = lang === 'fa' ? 'fa' : 'ar';
+      var voice = (speechSynthesis.getVoices() || []).filter(function (v) { return v.lang.toLowerCase().replace('_', '-').indexOf(prefix) === 0; })[0];
+      if (!voice && lang === 'fa') { toast('الآيفون ما عنده صوت فارسي. حط مفتاح OpenAI واختر صوت OpenAI من الإعدادات.'); return resolve(); }
+      var u = new SpeechSynthesisUtterance(text);
+      u.lang = lang === 'fa' ? 'fa-IR' : 'ar-SA';
+      if (voice) u.voice = voice;
+      var done = false, finish = function () { if (!done) { done = true; resolve(); } };
+      u.onend = finish; u.onerror = finish;
+      setTimeout(finish, 3000 + text.length * 120);
+      speechSynthesis.cancel(); speechSynthesis.speak(u);
+    });
   }
   async function speak(text, lang) {
+    setSession('playback');
     ensureAudio();
     if (S.ttsMode === 'openai' && S.openaiKey && navigator.onLine && ctx) {
       try {
@@ -351,11 +383,11 @@
         });
         if (!r.ok) throw new Error('tts ' + r.status);
         var buf = await decode(await r.arrayBuffer());
-        playBuffer(buf, earPan(lang));
+        await playBuffer(buf, earPan(lang));
         return;
       } catch (e) { toast('تعذّر صوت OpenAI، استخدمت صوت الجهاز'); }
     }
-    deviceSpeak(text, lang);
+    await deviceSpeak(text, lang);
   }
 
   /* ---------- translation ---------- */
@@ -427,61 +459,89 @@
       d.appendChild(meta); d.appendChild(src); d.appendChild(out);
       if (!t.pending && !t.error) {
         var b = document.createElement('button'); b.type = 'button'; b.className = 'btn'; b.textContent = 'أعد النطق';
-        b.addEventListener('click', function () { speak(t.out, t.from === 'ar' ? 'fa' : 'ar'); });
+        b.addEventListener('click', function () { unlockAudio(); speak(t.out, t.from === 'ar' ? 'fa' : 'ar'); });
         d.appendChild(b);
       }
       box.appendChild(d);
     });
     var m = document.querySelector('main'); m.scrollTop = m.scrollHeight;
   }
+  var live = null, rec = null, speaking = false, restartTimer = null, chain = Promise.resolve();
+
+  /* Pause the mic while the translation plays, so it does not hear itself. */
+  async function speakPaused(text, lang) {
+    speaking = true;
+    if (rec) { try { rec.abort(); } catch (e) {} rec = null; }
+    try { await speak(text, lang); } catch (e) {}
+    speaking = false;
+    if (live) {
+      if (S.autoFlip) { live = lang; setMic(live); }
+      if (!rec) startRec(live);
+    }
+  }
   async function handle(text, from) {
     var t = { from: from, src: text, pending: true };
     turns.push(t); render();
+    var out = null;
     try {
       var r = await translate(text, from);
       t.pending = false; t.out = r.text; t.via = r.via; render(); persist();
-      speak(r.text, from === 'ar' ? 'fa' : 'ar');
+      out = r.text;
     } catch (e) {
       t.pending = false; t.error = e.message; render();
     }
+    if (out) await speakPaused(out, from === 'ar' ? 'fa' : 'ar');
   }
+  function enqueue(text, from) { chain = chain.then(function () { return handle(text, from); }); }
 
-  /* ---------- speech recognition ---------- */
-  var rec = null, recLang = null;
+  /* ---------- live speech recognition ---------- */
   function setMic(lang) {
     $('micAr').classList.toggle('on', lang === 'ar');
     $('micFa').classList.toggle('on', lang === 'fa');
   }
-  function toggleMic(lang) {
-    ensureAudio();
-    if (rec) { rec.stop(); return; }
+  function stopLive() {
+    live = null; clearTimeout(restartTimer);
+    if (rec) { try { rec.abort(); } catch (e) {} rec = null; }
+    setMic(null); $('live').textContent = '';
+    setSession('playback');
+  }
+  function startRec(lang) {
     var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) { toast('هذا المتصفح ما يدعم التعرف على الصوت. افتحه من Safari، أو اكتب النص.'); return; }
-    var finalText = '';
-    rec = new SR(); recLang = lang;
-    rec.lang = lang === 'ar' ? S.arLocale : 'fa-IR';
-    rec.interimResults = true; rec.continuous = false;
-    rec.onresult = function (e) {
+    if (!SR) return;
+    var r = new SR(); rec = r;
+    r.lang = lang === 'ar' ? S.arLocale : 'fa-IR';
+    r.interimResults = true; r.continuous = true;
+    r.onresult = function (e) {
       var interim = '';
       for (var i = e.resultIndex; i < e.results.length; i++) {
         var res = e.results[i];
-        if (res.isFinal) finalText += res[0].transcript; else interim += res[0].transcript;
+        if (res.isFinal) { var t = res[0].transcript.trim(); if (t) enqueue(t, lang); }
+        else interim += res[0].transcript;
       }
-      $('live').textContent = finalText + interim;
+      $('live').textContent = interim || ('جارٍ الاستماع (' + NAME[lang] + ')…');
     };
-    rec.onerror = function (e) {
-      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') toast('اسمح للمايك والتعرف على الصوت من إعدادات Safari والآيفون.');
-      else if (e.error === 'no-speech') toast('ما سمعت شي');
-      else if (e.error === 'network') toast('التعرف على الصوت يحتاج إنترنت هنا. اكتب النص أو استخدم العبارات الجاهزة.');
-      else if (e.error === 'language-not-supported') toast('اللغة غير مدعومة للتعرف على الصوت في جهازك.');
+    r.onerror = function (e) {
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') { toast('اسمح للمايك والتعرف على الصوت من إعدادات Safari والآيفون.'); stopLive(); }
+      else if (e.error === 'language-not-supported') { toast('اللغة غير مدعومة للتعرف على الصوت في جهازك.'); stopLive(); }
+      else if (e.error === 'network') { toast('التعرف على الصوت يحتاج إنترنت. اكتب النص أو استخدم العبارات الجاهزة.'); stopLive(); }
     };
-    rec.onend = function () {
-      var text = finalText.trim(), l = recLang;
-      rec = null; recLang = null; setMic(null); $('live').textContent = '';
-      if (text) handle(text, l);
+    r.onend = function () {
+      if (rec === r) rec = null;
+      if (live && !speaking) {
+        clearTimeout(restartTimer);
+        restartTimer = setTimeout(function () { if (live && !rec && !speaking) startRec(live); }, 250);
+      }
     };
-    try { rec.start(); setMic(lang); $('live').textContent = 'جارٍ الاستماع…'; }
-    catch (e) { rec = null; setMic(null); toast('تعذّر تشغيل المايك'); }
+    try { setSession('play-and-record'); r.start(); $('live').textContent = 'جارٍ الاستماع (' + NAME[lang] + ')…'; }
+    catch (e) { rec = null; toast('تعذّر تشغيل المايك'); stopLive(); }
+  }
+  function toggleMic(lang) {
+    unlockAudio();
+    if (live === lang) { stopLive(); return; }
+    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) { toast('هذا المتصفح ما يدعم التعرف على الصوت. افتحه من Safari، أو اكتب النص.'); return; }
+    stopLive();
+    live = lang; setMic(lang); startRec(lang);
   }
 
   /* ---------- phrasebook list ---------- */
@@ -495,7 +555,7 @@
         var b = document.createElement('button'); b.type = 'button'; b.className = 'play';
         b.setAttribute('aria-label', 'انطق بالـ' + NAME[lang]);
         b.innerHTML = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 4l13 8-13 8z"/></svg>';
-        b.addEventListener('click', function () { speak(p[lang], lang); });
+        b.addEventListener('click', function () { unlockAudio(); speak(p[lang], lang); });
         cell.appendChild(t); cell.appendChild(b); row.appendChild(cell);
       });
       box.appendChild(row);
@@ -528,15 +588,17 @@
     b.addEventListener('click', function () { submitLang = b.getAttribute('data-lang'); });
   });
   $('typed').addEventListener('submit', function (e) {
-    e.preventDefault(); ensureAudio();
+    e.preventDefault(); unlockAudio();
     var v = $('typedText').value.trim();
     if (!v) return;
-    $('typedText').value = ''; handle(v, submitLang);
+    $('typedText').value = ''; enqueue(v, submitLang);
   });
+  function updateFlip() { $('flip').textContent = 'تبديل تلقائي: ' + (S.autoFlip ? 'يعمل' : 'متوقف'); }
+  $('flip').addEventListener('click', function () { S.autoFlip = !S.autoFlip; lsSet('settings', S); updateFlip(); });
   window.addEventListener('online', setNet); window.addEventListener('offline', setNet);
   if ('speechSynthesis' in window) speechSynthesis.getVoices();
 
-  setNet(); updateEars(); renderPB(); render();
+  setNet(); updateEars(); updateFlip(); renderPB(); render();
   if (!window.navigator.standalone && !(window.matchMedia && matchMedia('(display-mode: standalone)').matches)) $('installNote').hidden = false;
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(function () {});
 })();
