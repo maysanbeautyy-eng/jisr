@@ -1,5 +1,5 @@
 /* Service worker: caches the app shell so it opens with no internet. Pages load network-first so updates arrive. */
-const CACHE = 'jisr-v2';
+const CACHE = 'jisr-v3';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './apple-touch-icon.png'];
 
 self.addEventListener('install', (e) => {
@@ -7,9 +7,10 @@ self.addEventListener('install', (e) => {
 });
 
 self.addEventListener('activate', (e) => {
+  // Remove old shell caches only. The saved voice audio (jisr-audio-*) must survive updates.
   e.waitUntil(
     caches.keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
+      .then((keys) => Promise.all(keys.filter((k) => k.startsWith('jisr-v') && k !== CACHE).map((k) => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
@@ -27,8 +28,8 @@ self.addEventListener('fetch', (e) => {
   };
 
   if (req.mode === 'navigate') {
-    e.respondWith(fetch(req).then(save).catch(() => caches.match(req).then((h) => h || caches.match('./index.html'))));
+    e.respondWith(fetch(req).then(save).catch(() => caches.match(req, { cacheName: CACHE }).then((h) => h || caches.match('./index.html', { cacheName: CACHE }))));
     return;
   }
-  e.respondWith(caches.match(req).then((hit) => hit || fetch(req).then(save)));
+  e.respondWith(caches.match(req, { cacheName: CACHE }).then((hit) => hit || fetch(req).then(save)));
 });
